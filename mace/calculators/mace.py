@@ -244,6 +244,7 @@ class MACECalculator(Calculator):
             out = model(
                 batch.to_dict(),
                 compute_stress=compute_stress,
+                compute_atom_virials=True,
                 training=self.use_compile,
             )
             if self.model_type in ["MACE", "EnergyDipoleMACE"]:
@@ -252,6 +253,8 @@ class MACECalculator(Calculator):
                 ret_tensors["forces"][i] = out["forces"].detach()
                 if out["stress"] is not None:
                     ret_tensors["stress"][i] = out["stress"].detach()
+                if out["atom_virials"] is not None:
+                    ret_tensors["atom_virials"] = out["atom_virials"].detach()
             if self.model_type in ["DipoleMACE", "EnergyDipoleMACE"]:
                 ret_tensors["dipole"][i] = out["dipole"].detach()
 
@@ -299,6 +302,12 @@ class MACECalculator(Calculator):
                         * self.energy_units_to_eV
                         / self.length_units_to_A**3
                     )
+            if "atom_virials" in ret_tensors:
+                self.results["atom_virials"] = (
+                    ret_tensors["atom_virials"].cpu().numpy()
+                    * self.energy_units_to_eV
+                    / self.length_units_to_A**3
+                )
         if self.model_type in ["DipoleMACE", "EnergyDipoleMACE"]:
             self.results["dipole"] = (
                 torch.mean(ret_tensors["dipole"], dim=0).cpu().numpy()

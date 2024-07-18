@@ -175,6 +175,7 @@ class MACE(torch.nn.Module):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
+        compute_atom_virials: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["node_attrs"].requires_grad_(True)
@@ -263,7 +264,7 @@ class MACE(torch.nn.Module):
         node_energy = torch.sum(node_energy_contributions, dim=-1)  # [n_nodes, ]
 
         # Outputs
-        forces, virials, stress, hessian = get_outputs(
+        forces, virials, stress, hessian, atom_virials = get_outputs(
             energy=total_energy,
             positions=data["positions"],
             displacement=displacement,
@@ -273,6 +274,7 @@ class MACE(torch.nn.Module):
             compute_virials=compute_virials,
             compute_stress=compute_stress,
             compute_hessian=compute_hessian,
+            compute_atom_virials=compute_atom_virials,
         )
 
         return {
@@ -281,6 +283,7 @@ class MACE(torch.nn.Module):
             "contributions": contributions,
             "forces": forces,
             "virials": virials,
+            "atom_virials": atom_virials,
             "stress": stress,
             "displacement": displacement,
             "hessian": hessian,
@@ -310,6 +313,7 @@ class ScaleShiftMACE(MACE):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
+        compute_atom_virials: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["positions"].requires_grad_(True)
@@ -392,16 +396,19 @@ class ScaleShiftMACE(MACE):
         # Add E_0 and (scaled) interaction energy
         total_energy = e0 + inter_e
         node_energy = node_e0 + node_inter_es
-        forces, virials, stress, hessian = get_outputs(
+        forces, virials, stress, hessian, atom_virials = get_outputs(
             energy=inter_e,
             positions=data["positions"],
             displacement=displacement,
+            edge_vectors=vectors,
+            edge_index=data["edge_index"],
             cell=data["cell"],
             training=training,
             compute_force=compute_force,
             compute_virials=compute_virials,
             compute_stress=compute_stress,
             compute_hessian=compute_hessian,
+            compute_atom_virials=compute_atom_virials,
         )
         output = {
             "energy": total_energy,
@@ -409,6 +416,7 @@ class ScaleShiftMACE(MACE):
             "interaction_energy": inter_e,
             "forces": forces,
             "virials": virials,
+            "atom_virials": atom_virials,
             "stress": stress,
             "hessian": hessian,
             "displacement": displacement,
@@ -946,6 +954,7 @@ class EnergyDipolesMACE(torch.nn.Module):
         compute_virials: bool = False,
         compute_stress: bool = False,
         compute_displacement: bool = False,
+        compute_atom_virials: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["node_attrs"].requires_grad_(True)
@@ -1040,15 +1049,19 @@ class EnergyDipolesMACE(torch.nn.Module):
         )  # [n_graphs,3]
         total_dipole = total_dipole + baseline
 
-        forces, virials, stress, _ = get_outputs(
+        forces, virials, stress, _, atom_virials = get_outputs(
             energy=total_energy,
             positions=data["positions"],
             displacement=displacement,
             cell=data["cell"],
+            edge_vectors=vectors,
+            edge_index=data["edge_index"],
+            velocities=data.get("velocities", None),
             training=training,
             compute_force=compute_force,
             compute_virials=compute_virials,
             compute_stress=compute_stress,
+            compute_atom_virials=compute_atom_virials,
         )
 
         output = {
@@ -1057,6 +1070,7 @@ class EnergyDipolesMACE(torch.nn.Module):
             "contributions": contributions,
             "forces": forces,
             "virials": virials,
+            "atom_virials": atom_virials,
             "stress": stress,
             "displacement": displacement,
             "dipole": total_dipole,
