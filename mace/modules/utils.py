@@ -70,79 +70,6 @@ def compute_forces_virials(
     return -1 * forces, -1 * virials, stress
 
 
-def compute_forces_atom_virials(
-    energy: torch.Tensor,
-    node_energy: torch.Tensor,
-    positions: torch.Tensor,
-    displacement: torch.Tensor,
-    edge_vectors: torch.Tensor,
-    edge_index: torch.Tensor,
-    cell: torch.Tensor,
-    training: bool = True,
-    compute_stress: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-    grad_outputs: List[Optional[torch.Tensor]] = [
-        torch.ones((node_energy.shape[0], node_energy.shape[0])).cuda()
-    ]
-    device = positions.device
-    # grad_outputs: List[Optional[torch.Tensor]] = [torch.ones((1)).to(device)]
-
-    for i in range(positions.shape[0]):
-        energy_i = node_energy * torch.nn.functional.one_hot(torch.arange(424))[i].to(
-            device
-        )
-        force_vector_i = torch.autograd.grad(
-            outputs=[energy_i.sum()],  # [n_graphs, ]
-            inputs=[positions],  # [n_nodes, ]
-            # grad_outputs=grad_outputs,
-            retain_graph=True,  # Make sure the graph is not destroyed during training
-            create_graph=training,  # Create graph for second derivative
-            allow_unused=True,
-        )[0]
-
-    print(force_vector_i.shape)
-
-    # edge_virial = torch.einsum("zi,zj->zij", force_vector, edge_vectors)
-    # atom_virial = scatter_sum(
-    #     edge_virial, edge_index[0], dim=0, dim_size=len(positions)
-    # )
-
-    # scattered_virial = scatter_sum(
-    #     edge_virial, edge_index[1], dim=0, dim_size=len(positions)
-    # )
-    # atom_virial = (atom_virial + scattered_virial) / 2
-
-    # virials = atom_virial.sum(dim=0)
-
-    # virials = (virials + virials.transpose(-1, -2)) / 2
-
-    # stress = torch.zeros((1, 3, 3))
-    # if compute_stress and virials is not None:
-    #     cell = cell.view(-1, 3, 3)
-    #     volume = torch.einsum(
-    #         "zi,zi->z",
-    #         cell[:, 0, :],
-    #         torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
-    #     ).unsqueeze(-1)
-    #     stress = virials / volume.view(-1, 1, 1)
-
-    # if forces is None:
-    #     forces = torch.zeros_like(positions)
-
-    # if virials is None:
-    #     virials = torch.zeros((1, 3, 3))
-
-    # if atom_virial is None:
-    #     atom_virial = torch.zeros((1, 3, 3))
-
-    forces = torch.zeros_like(positions)
-    virials = torch.zeros((1, 3, 3))
-    stress = torch.zeros((1, 3, 3))
-    atom_virial = torch.zeros((1, 3, 3))
-
-    return -1 * forces, -1 * virials, stress, -1 * atom_virial
-
-
 # def compute_forces_atom_virials(
 #     energy: torch.Tensor,
 #     node_energy: torch.Tensor,
@@ -154,51 +81,124 @@ def compute_forces_atom_virials(
 #     training: bool = True,
 #     compute_stress: bool = False,
 # ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-#     grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(energy)]
+#     grad_outputs: List[Optional[torch.Tensor]] = [
+#         torch.ones((node_energy.shape[0], node_energy.shape[0])).cuda()
+#     ]
+#     device = positions.device
+#     # grad_outputs: List[Optional[torch.Tensor]] = [torch.ones((1)).to(device)]
 
-#     forces, force_vector = torch.autograd.grad(
-#         outputs=[energy],  # [n_graphs, ]
-#         inputs=[positions, edge_vectors],  # [n_nodes, ]
-#         grad_outputs=grad_outputs,
-#         retain_graph=True,  # Make sure the graph is not destroyed during training
-#         create_graph=training,  # Create graph for second derivative
-#         allow_unused=True,
-#     )
+#     for i in range(positions.shape[0]):
+#         energy_i = node_energy * torch.nn.functional.one_hot(
+#             torch.arange(positions.shape[0])
+#         )[i].to(device)
+#         force_vector_i = torch.autograd.grad(
+#             outputs=[energy_i.sum()],  # [n_graphs, ]
+#             inputs=[positions],  # [n_nodes, ]
+#             # grad_outputs=grad_outputs,
+#             retain_graph=True,  # Make sure the graph is not destroyed during training
+#             create_graph=training,  # Create graph for second derivative
+#             allow_unused=True,
+#         )[0]
 
-#     edge_virial = torch.einsum("zi,zj->zij", force_vector, edge_vectors)
-#     atom_virial = scatter_sum(
-#         edge_virial, edge_index[0], dim=0, dim_size=len(positions)
-#     )
+#     print(force_vector_i.shape)
 
-#     scattered_virial = scatter_sum(
-#         edge_virial, edge_index[1], dim=0, dim_size=len(positions)
-#     )
-#     atom_virial = (atom_virial + scattered_virial) / 2
+#     # edge_virial = torch.einsum("zi,zj->zij", force_vector, edge_vectors)
+#     # atom_virial = scatter_sum(
+#     #     edge_virial, edge_index[0], dim=0, dim_size=len(positions)
+#     # )
 
-#     virials = atom_virial.sum(dim=0)
+#     # scattered_virial = scatter_sum(
+#     #     edge_virial, edge_index[1], dim=0, dim_size=len(positions)
+#     # )
+#     # atom_virial = (atom_virial + scattered_virial) / 2
 
-#     virials = (virials + virials.transpose(-1, -2)) / 2
+#     # virials = atom_virial.sum(dim=0)
 
+#     # virials = (virials + virials.transpose(-1, -2)) / 2
+
+#     # stress = torch.zeros((1, 3, 3))
+#     # if compute_stress and virials is not None:
+#     #     cell = cell.view(-1, 3, 3)
+#     #     volume = torch.einsum(
+#     #         "zi,zi->z",
+#     #         cell[:, 0, :],
+#     #         torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
+#     #     ).unsqueeze(-1)
+#     #     stress = virials / volume.view(-1, 1, 1)
+
+#     # if forces is None:
+#     #     forces = torch.zeros_like(positions)
+
+#     # if virials is None:
+#     #     virials = torch.zeros((1, 3, 3))
+
+#     # if atom_virial is None:
+#     #     atom_virial = torch.zeros((1, 3, 3))
+
+#     forces = torch.zeros_like(positions)
+#     virials = torch.zeros((1, 3, 3))
 #     stress = torch.zeros((1, 3, 3))
-#     if compute_stress and virials is not None:
-#         cell = cell.view(-1, 3, 3)
-#         volume = torch.einsum(
-#             "zi,zi->z",
-#             cell[:, 0, :],
-#             torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
-#         ).unsqueeze(-1)
-#         stress = virials / volume.view(-1, 1, 1)
-
-#     if forces is None:
-#         forces = torch.zeros_like(positions)
-
-#     if virials is None:
-#         virials = torch.zeros((1, 3, 3))
-
-#     if atom_virial is None:
-#         atom_virial = torch.zeros((1, 3, 3))
+#     atom_virial = torch.zeros((1, 3, 3))
 
 #     return -1 * forces, -1 * virials, stress, -1 * atom_virial
+
+
+def compute_forces_atom_virials(
+    energy: torch.Tensor,
+    node_energy: torch.Tensor,
+    positions: torch.Tensor,
+    displacement: torch.Tensor,
+    edge_vectors: torch.Tensor,
+    edge_index: torch.Tensor,
+    cell: torch.Tensor,
+    training: bool = True,
+    compute_stress: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(energy)]
+
+    forces, force_vector = torch.autograd.grad(
+        outputs=[energy],  # [n_graphs, ]
+        inputs=[positions, edge_vectors],  # [n_nodes, ]
+        grad_outputs=grad_outputs,
+        retain_graph=True,  # Make sure the graph is not destroyed during training
+        create_graph=training,  # Create graph for second derivative
+        allow_unused=True,
+    )
+
+    edge_virial = torch.einsum("zi,zj->zij", force_vector, edge_vectors)
+    atom_virial = scatter_sum(
+        edge_virial, edge_index[0], dim=0, dim_size=len(positions)
+    )
+
+    scattered_virial = scatter_sum(
+        edge_virial, edge_index[1], dim=0, dim_size=len(positions)
+    )
+    atom_virial = (atom_virial + scattered_virial) / 2
+
+    virials = atom_virial.sum(dim=0)
+
+    virials = (virials + virials.transpose(-1, -2)) / 2
+
+    stress = torch.zeros((1, 3, 3))
+    if compute_stress and virials is not None:
+        cell = cell.view(-1, 3, 3)
+        volume = torch.einsum(
+            "zi,zi->z",
+            cell[:, 0, :],
+            torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
+        ).unsqueeze(-1)
+        stress = virials / volume.view(-1, 1, 1)
+
+    if forces is None:
+        forces = torch.zeros_like(positions)
+
+    if virials is None:
+        virials = torch.zeros((1, 3, 3))
+
+    if atom_virial is None:
+        atom_virial = torch.zeros((1, 3, 3))
+
+    return -1 * forces, -1 * virials, stress, -1 * atom_virial
 
 
 def get_symmetric_displacement(

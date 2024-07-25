@@ -244,7 +244,7 @@ class MACECalculator(Calculator):
             out = model(
                 batch.to_dict(),
                 compute_stress=compute_stress,
-                compute_atom_virials=True,
+                # compute_atom_virials=True,
                 training=self.use_compile,
             )
             if self.model_type in ["MACE", "EnergyDipoleMACE"]:
