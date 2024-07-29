@@ -1,5 +1,6 @@
 import torch as th
 from collections import namedtuple
+import ase
 
 System = namedtuple("System", ("R", "Z", "cell"))
 UnfoldedSystem = namedtuple(
@@ -87,13 +88,13 @@ def collision(X, heights, cutoff):
     z_lo = X[2] <= cutoff
     z_hi = X[2] >= heights[2] - cutoff
 
-    return th.tensor([x_lo, x_hi, y_lo, y_hi, z_lo, z_hi], dtype=bool)
+    return th.tensor([x_lo, x_hi, y_lo, y_hi, z_lo, z_hi], dtype=bool, device=X.device)
 
 
 def collision_to_replica(collision):
     x_lo, x_hi, y_lo, y_hi, z_lo, z_hi = collision
 
-    out = th.zeros((3, 3, 3), dtype=bool)
+    out = th.zeros((3, 3, 3), dtype=bool, device=collision.device)
 
     # 6 faces
 
@@ -233,11 +234,22 @@ def atoms_to_system(atoms):
     return System(R, Z, cell)
 
 
-def system_to_atoms(system, atoms):
-    atoms = atoms.set_positions(system.R)
-    atoms = atoms.set_atomic_numbers(system.Z)
-    atoms = atoms.set_cell(system.cell)
-    return atoms
+def system_to_atoms(system, atoms=None):
+    new_atoms = ase.Atoms(
+        symbols=system.Z,
+        positions=system.R,
+        cell=system.cell,
+        pbc=False,
+    )
+
+    if atoms is not None:
+        new_atoms.set_cell(atoms.get_cell())
+    elif system.cell is None:
+        import warnings
+
+        warnings.warn("No cell information available")
+
+    return new_atoms
 
 
 def unfolder(system, cutoff, skin):

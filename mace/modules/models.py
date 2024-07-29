@@ -14,6 +14,7 @@ from e3nn.util.jit import compile_mode
 from mace.data import AtomicData
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_sum
+from mace.modules.unfolding import UnfoldedSystem
 
 from .blocks import (
     AtomicEnergiesBlock,
@@ -175,7 +176,10 @@ class MACE(torch.nn.Module):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
-        compute_atom_virials: bool = False,
+        compute_heat_flux: bool = False,
+        velocities: Optional[torch.Tensor] = None,
+        big: Optional[UnfoldedSystem] = None,
+        masses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["node_attrs"].requires_grad_(True)
@@ -275,7 +279,10 @@ class MACE(torch.nn.Module):
             compute_virials=compute_virials,
             compute_stress=compute_stress,
             compute_hessian=compute_hessian,
-            compute_atom_virials=compute_atom_virials,
+            compute_heat_flux=compute_heat_flux,
+            velocities=velocities,
+            big=big,
+            masses=masses,
         )
 
         return {
@@ -314,11 +321,15 @@ class ScaleShiftMACE(MACE):
         compute_stress: bool = False,
         compute_displacement: bool = False,
         compute_hessian: bool = False,
-        compute_atom_virials: bool = False,
+        compute_heat_flux: bool = False,
+        velocities: Optional[torch.Tensor] = None,
+        big: Optional[UnfoldedSystem] = None,
+        masses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
-        # data["positions"].requires_grad_(True)
-        # data["node_attrs"].requires_grad_(True)
+        if big is None:
+            data["positions"].requires_grad_(True)
+            data["node_attrs"].requires_grad_(True)
         num_graphs = data["ptr"].numel() - 1
         displacement = torch.zeros(
             (num_graphs, 3, 3),
@@ -399,67 +410,160 @@ class ScaleShiftMACE(MACE):
             total_energy = e0 + inter_e
             node_energy = node_e0 + node_inter_es
 
-            return total_energy, node_energy, inter_e, vectors, node_feats_out
+            return node_energy, (total_energy, inter_e, vectors, node_feats_out)
 
-        def get_energy_node(positions, node_index):
-            total_energy, node_energy, inter_e, vectors, node_feats_out = get_energies(
-                positions
+        def get_total_energy(positions):
+            node_energy, (total_energy, inter_e, vectors, node_feats_out) = (
+                get_energies(positions)
             )
 
-            atoms = positions.shape[0]
+            if big is not None:
+                mask = big.mask.to(positions.device)
+                replica_idx = big.replica_idx.to(positions.device)
+                node_energy = node_energy * mask
+                total_energy = node_energy.sum()
+            else:
+                total_energy = total_energy.sum()
 
-            one_hot = node_index.expand((atoms))
-            one_hot = one_hot == torch.arange(atoms)
+            return total_energy, (node_energy, inter_e, vectors, node_feats_out)
 
-            return (
-                # torch.index_select(node_energy.cuda(), 0, node_index.cuda())
-                node_energy.cuda()
-                * one_hot.cuda()
-            ).sum(), (
-                total_energy,
-                inter_e,
-                vectors,
-                node_feats_out,
+        def barycenter_fn(positions, r_aux):
+            node_energy, _ = get_energies(positions)
+            mask = big.mask.to(data["positions"].device)
+            energies = node_energy * mask
+            barycenter = energies[:, None] * r_aux
+            return torch.sum(barycenter, axis=0)
+
+        grad_func = torch.func.grad_and_value(
+            get_total_energy,
+            has_aux=True,
+        )
+
+        grad, (total_energy, aux) = grad_func(data["positions"])
+        total_energy = total_energy.unsqueeze(0)
+        (node_energy, inter_e, vectors, node_feats_out) = aux
+        forces = -grad
+        virials = torch.zeros((1, 3, 3))
+        stress = torch.zeros((1, 3, 3))
+        hessian = None
+        atom_virials = None
+
+        if big is not None:
+            cell = data["cell"].view(-1, 3, 3)
+            volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+            stress = torch.einsum("ia,ib->ab", data["positions"], grad) / volume
+            stress = torch.where(
+                torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
+            )
+            replica_idx = big.replica_idx.to(data["positions"].device)
+            forces = scatter_sum(
+                forces,
+                replica_idx,
+                dim_size=masses.shape[0],
+                dim=0,
+            )
+        elif compute_virials or compute_stress:
+            grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(total_energy)]
+            virials = torch.autograd.grad(
+                outputs=[total_energy],  # [n_graphs, ]
+                inputs=[displacement],  # [n_nodes, 3]
+                grad_outputs=grad_outputs,
+                retain_graph=training,  # Make sure the graph is not destroyed during training
+                create_graph=training,  # Create graph for second derivative
+                allow_unused=True,
+            )[0]
+            stress = torch.zeros_like(displacement)
+            if compute_stress and virials is not None:
+                cell = data["cell"].view(-1, 3, 3)
+                volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+                stress = virials / volume.view(-1, 1, 1)
+                stress = torch.where(
+                    torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
+                )
+
+        heat_flux = None
+        if compute_heat_flux:
+
+            assert velocities is not None, "Velocities must be provided for heat flux"
+            assert masses is not None, "Masses must be provided for heat flux"
+
+            r_aux = data["positions"].detach()
+
+            velocities = (
+                torch.tensor(velocities)
+                .to(data["positions"].device)
+                .to(data["positions"].dtype)
+            )
+            unfolded_velocities = velocities[big.replica_idx]
+
+            _, term_1 = torch.func.jvp(
+                lambda R: barycenter_fn(
+                    R,
+                    r_aux,
+                ),
+                (data["positions"],),
+                (unfolded_velocities,),
             )
 
-        # grad_func = torch.func.grad(
-        #     get_energy_node,
-        #     has_aux=True,
+            term_2 = torch.sum(
+                torch.sum(grad * unfolded_velocities, axis=1)[:, None] * r_aux,
+                axis=0,
+            )
+            hf_potential = term_1 - term_2
+
+            masses = (
+                torch.tensor(masses)
+                .to(data["positions"].device)
+                .to(data["positions"].dtype)
+            )
+            energies_kinetic = 0.5 * torch.einsum(
+                "i,ia,ia->i", masses, velocities, velocities
+            )
+            hf_convective_kinetic = torch.einsum(
+                "i,ia->a", energies_kinetic, velocities
+            )
+            hf_convective_potential = torch.einsum(
+                "i,ia->a", node_energy, unfolded_velocities
+            )
+            hf_convective = hf_convective_potential + hf_convective_kinetic
+
+            cell = data["cell"].view(-1, 3, 3)
+            volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+
+            heat_flux = (hf_potential + hf_convective) / volume
+
+        if big is not None:
+            node_energy = scatter_sum(
+                node_energy,
+                replica_idx,
+                dim_size=masses.shape[0],
+                dim=0,
+            )
+
+        # total_energy, (node_energy, inter_e, vectors, node_feats_out) = (
+        #     get_total_energy(data["positions"])
         # )
 
-        # def vmapped(i):
-        #     return grad_func(data["positions"], i)[0]
-
-        # indices = torch.arange(2)  # data["positions"].shape[0])
-        # o = torch.func.vmap(vmapped)(indices)
-        # print(o.shape)
-
-        # (total_energy, inter_e, vectors, node_feats_out) = aux
-        # total_energy, (node_energy, inter_e, vectors, node_feats_out) = v
-        # # print(-g)
-        # node_energy, (total_energy, inter_e, vectors, node_feats_out) = v
-
-        total_energy, node_energy, inter_e, vectors, node_feats_out = get_energies(
-            data["positions"]
-        )
-
-        forces, virials, stress, hessian, atom_virials = (
-            get_outputs(  # (-g, None, None, None, None)
-                energy=inter_e,
-                node_energy=node_energy,
-                positions=data["positions"],
-                displacement=displacement,
-                edge_vectors=vectors,
-                edge_index=data["edge_index"],
-                cell=data["cell"],
-                training=training,
-                compute_force=compute_force,
-                compute_virials=compute_virials,
-                compute_stress=compute_stress,
-                compute_hessian=compute_hessian,
-                compute_atom_virials=compute_atom_virials,
-            )
-        )
+        # forces, virials, stress, hessian, atom_virials = (
+        #     get_outputs(  # (-g, None, None, None, None)
+        #         energy=inter_e,
+        #         node_energy=node_energy,
+        #         positions=data["positions"],
+        #         displacement=displacement,
+        #         edge_vectors=vectors,
+        #         edge_index=data["edge_index"],
+        #         cell=data["cell"],
+        #         training=training,
+        #         compute_force=compute_force,
+        #         compute_virials=compute_virials,
+        #         compute_stress=compute_stress,
+        #         compute_hessian=compute_hessian,
+        #         compute_heat_flux=compute_heat_flux,
+        #         velocities=velocities,
+        #         big=big,
+        #         masses=masses,
+        #     )
+        # )
 
         output = {
             "energy": total_energy,
@@ -468,6 +572,7 @@ class ScaleShiftMACE(MACE):
             "forces": forces,
             "virials": virials,
             "atom_virials": atom_virials,
+            "heat_flux": heat_flux,
             "stress": stress,
             "hessian": hessian,
             "displacement": displacement,
@@ -1005,7 +1110,10 @@ class EnergyDipolesMACE(torch.nn.Module):
         compute_virials: bool = False,
         compute_stress: bool = False,
         compute_displacement: bool = False,
-        compute_atom_virials: bool = False,
+        compute_heat_flux: bool = False,
+        velocities: Optional[torch.Tensor] = None,
+        big: Optional[UnfoldedSystem] = None,
+        masses: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
         data["node_attrs"].requires_grad_(True)
@@ -1108,12 +1216,14 @@ class EnergyDipolesMACE(torch.nn.Module):
             cell=data["cell"],
             edge_vectors=vectors,
             edge_index=data["edge_index"],
-            velocities=data.get("velocities", None),
             training=training,
             compute_force=compute_force,
             compute_virials=compute_virials,
             compute_stress=compute_stress,
-            compute_atom_virials=compute_atom_virials,
+            compute_heat_flux=compute_heat_flux,
+            velocities=velocities,
+            big=big,
+            masses=masses,
         )
 
         output = {

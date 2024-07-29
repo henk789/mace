@@ -19,6 +19,12 @@ from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
 from mace.tools.compile import prepare
 from mace.tools.scripts_utils import extract_load
+from mace.modules.unfolding import (
+    unfolder,
+    unfold_system,
+    atoms_to_system,
+    system_to_atoms,
+)
 
 
 def get_model_dtype(model: torch.nn.Module) -> torch.dtype:
@@ -58,6 +64,8 @@ class MACECalculator(Calculator):
         model_type="MACE",
         compile_mode=None,
         fullgraph=True,
+        unfolding=False,
+        compute_heat_flux=False,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -164,6 +172,15 @@ class MACECalculator(Calculator):
             for param in model.parameters():
                 param.requires_grad = False
 
+        self.unfolding = unfolding
+        self.compute_heat_flux = compute_heat_flux
+
+    def set_unfolding(self, unfolding):
+        self.unfolding = unfolding
+
+    def set_compute_heat_flux(self, compute_heat_flux):
+        self.compute_heat_flux = compute_heat_flux
+
     def _create_result_tensors(
         self, model_type: str, num_models: int, num_atoms: int
     ) -> dict:
@@ -224,6 +241,24 @@ class MACECalculator(Calculator):
         :param system_changes: [str], system changes since last calculation, used by ASE internally
         :return:
         """
+
+        big = None
+        velocities = None
+        masses = None
+        big_batch_base = None
+        if self.unfolding or self.compute_heat_flux:
+            M = 2  # number of message-passing steps of medium model
+            r_max_eff = self.r_max * M
+            skin_unfolder = 0.1
+            system = atoms_to_system(atoms)
+            unfolding = unfolder(system, r_max_eff, skin_unfolder)
+            big = unfold_system(system, unfolding)
+            big_atoms = system_to_atoms(big, atoms)
+            velocities = atoms.get_velocities()
+            masses = atoms.get_masses()
+            # atoms = big_atoms
+            big_batch_base = self._atoms_to_batch(big_atoms)
+
         # call to base-class to set atoms attribute
         Calculator.calculate(self, atoms)
 
@@ -236,15 +271,26 @@ class MACECalculator(Calculator):
         else:
             compute_stress = False
 
+        compute_heat_flux = False
+        if self.model_type in ["MACE"] and self.compute_heat_flux:
+            compute_heat_flux = True
+
         ret_tensors = self._create_result_tensors(
-            self.model_type, self.num_models, len(atoms)
+            self.model_type, self.num_models, len(atoms) if big is None else len(masses)
         )
         for i, model in enumerate(self.models):
-            batch = self._clone_batch(batch_base)
+            batch = (
+                self._clone_batch(batch_base)
+                if big_batch_base is None
+                else self._clone_batch(big_batch_base)
+            )
             out = model(
                 batch.to_dict(),
                 compute_stress=compute_stress,
-                # compute_atom_virials=True,
+                compute_heat_flux=compute_heat_flux,
+                velocities=velocities,
+                big=big,
+                masses=masses,
                 training=self.use_compile,
             )
             if self.model_type in ["MACE", "EnergyDipoleMACE"]:
@@ -253,8 +299,6 @@ class MACECalculator(Calculator):
                 ret_tensors["forces"][i] = out["forces"].detach()
                 if out["stress"] is not None:
                     ret_tensors["stress"][i] = out["stress"].detach()
-                if out["atom_virials"] is not None:
-                    ret_tensors["atom_virials"] = out["atom_virials"].detach()
             if self.model_type in ["DipoleMACE", "EnergyDipoleMACE"]:
                 ret_tensors["dipole"][i] = out["dipole"].detach()
 
@@ -302,12 +346,8 @@ class MACECalculator(Calculator):
                         * self.energy_units_to_eV
                         / self.length_units_to_A**3
                     )
-            if "atom_virials" in ret_tensors:
-                self.results["atom_virials"] = (
-                    ret_tensors["atom_virials"].cpu().numpy()
-                    * self.energy_units_to_eV
-                    / self.length_units_to_A**3
-                )
+            if out["heat_flux"] is not None:
+                self.results["heat_flux"] = out["heat_flux"].detach().cpu().numpy()
         if self.model_type in ["DipoleMACE", "EnergyDipoleMACE"]:
             self.results["dipole"] = (
                 torch.mean(ret_tensors["dipole"], dim=0).cpu().numpy()

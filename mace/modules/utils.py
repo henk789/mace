@@ -16,6 +16,7 @@ from scipy.constants import c, e
 from mace.tools import to_numpy
 from mace.tools.scatter import scatter_sum
 from mace.tools.torch_geometric.batch import Batch
+from mace.modules.unfolding import UnfoldedSystem
 
 from .blocks import AtomicEnergiesBlock
 
@@ -70,6 +71,7 @@ def compute_forces_virials(
     return -1 * forces, -1 * virials, stress
 
 
+## HARDY heat flux attempt: memory requirements too large
 # def compute_forces_atom_virials(
 #     energy: torch.Tensor,
 #     node_energy: torch.Tensor,
@@ -141,6 +143,69 @@ def compute_forces_virials(
 #     atom_virial = torch.zeros((1, 3, 3))
 
 #     return -1 * forces, -1 * virials, stress, -1 * atom_virial
+
+
+def compute_forces_heat_flux(
+    energy: torch.Tensor,
+    node_energy: torch.Tensor,
+    positions: torch.Tensor,
+    displacement: torch.Tensor,
+    edge_vectors: torch.Tensor,
+    edge_index: torch.Tensor,
+    cell: torch.Tensor,
+    velocities: torch.Tensor,
+    big: UnfoldedSystem,
+    masses: torch.Tensor,
+    training: bool = True,
+    compute_stress: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+
+    grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(energy)]
+    unfolded_forces = torch.autograd.grad(
+        outputs=[energy],  # [n_graphs, ]
+        inputs=[positions],  # [n_nodes, ]
+        grad_outputs=grad_outputs,
+        retain_graph=True,  # Make sure the graph is not destroyed during training
+        create_graph=training,  # Create graph for second derivative
+        allow_unused=True,
+    )[0]
+
+    mask = big.mask.to(unfolded_forces.device)
+    velocities = torch.tensor(velocities, device=unfolded_forces.device)
+    replica_idx = big.replica_idx.to(unfolded_forces.device)
+
+    forces = scatter_sum(
+        mask[:, None] * unfolded_forces,
+        replica_idx,
+        dim_size=positions.shape[0],
+        dim=0,
+    )
+
+    unfolded_velocities = velocities[big.replica_idx]
+
+    r_aux = positions.detach()
+    barycenter = torch.sum((node_energy * mask)[:, None] * r_aux, dim=0)
+
+    positions.retain_grad()
+    barycenter.backward(torch.ones_like(barycenter))
+    barycenter_grad = positions.grad.detach()
+    print(barycenter_grad.shape)
+
+    term_1 = barycenter_grad @ unfolded_velocities
+
+    term_2 = torch.sum(
+        torch.sum(unfolded_forces * unfolded_velocities, axis=1)[:, None] * r_aux,
+        axis=0,
+    )
+
+    hf_potential = term_1 - term_2
+
+    energies_kinetic = 0.5 * torch.einsum("i,ia,ia->i", masses, velocities, velocities)
+    hf_convective_kinetic = torch.einsum("i,ia->a", energies_kinetic, velocities)
+    hf_convective_potential = torch.einsum("i,ia->a", node_energy, unfolded_velocities)
+    hf_convective = hf_convective_potential + hf_convective_kinetic
+
+    return -1 * forces, hf_potential + hf_convective
 
 
 def compute_forces_atom_virials(
@@ -309,6 +374,10 @@ def get_outputs(
     compute_stress: bool = True,
     compute_hessian: bool = False,
     compute_atom_virials: bool = False,
+    compute_heat_flux: bool = False,
+    velocities: Optional[torch.Tensor] = None,
+    big: Optional[UnfoldedSystem] = None,
+    masses: Optional[torch.Tensor] = None,
 ) -> Tuple[
     Optional[torch.Tensor],
     Optional[torch.Tensor],
@@ -316,8 +385,26 @@ def get_outputs(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
+    if compute_heat_flux:
+        forces, heat_flux = compute_forces_heat_flux(
+            energy=energy,
+            node_energy=node_energy,
+            positions=positions,
+            displacement=displacement,
+            edge_vectors=edge_vectors,
+            edge_index=edge_index,
+            cell=cell,
+            velocities=velocities,
+            training=(training or compute_hessian),
+            compute_stress=compute_stress,
+            big=big,
+            masses=masses,
+        )
+        stress = None
+        virials = None
+        atom_virials = None
 
-    if compute_atom_virials and edge_vectors is not None and edge_index is not None:
+    elif compute_atom_virials and edge_vectors is not None and edge_index is not None:
         forces, virials, stress, atom_virials = compute_forces_atom_virials(
             energy=energy,
             node_energy=node_energy,
