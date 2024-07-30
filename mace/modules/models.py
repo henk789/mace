@@ -325,11 +325,9 @@ class ScaleShiftMACE(MACE):
         velocities: Optional[torch.Tensor] = None,
         big: Optional[UnfoldedSystem] = None,
         masses: Optional[torch.Tensor] = None,
+        old_method: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         # Setup
-        if big is None:
-            data["positions"].requires_grad_(True)
-            data["node_attrs"].requires_grad_(True)
         num_graphs = data["ptr"].numel() - 1
         displacement = torch.zeros(
             (num_graphs, 3, 3),
@@ -434,152 +432,172 @@ class ScaleShiftMACE(MACE):
             barycenter = energies[:, None] * r_aux
             return torch.sum(barycenter, axis=0)
 
-        grad_func = torch.func.grad_and_value(
-            get_total_energy,
-            has_aux=True,
-        )
+        if old_method:
+            data["positions"].requires_grad_(True)
+            data["node_attrs"].requires_grad_(True)
 
-        grad, (total_energy, aux) = grad_func(data["positions"])
-        total_energy = total_energy.unsqueeze(0)
-        (node_energy, inter_e, vectors, node_feats_out) = aux
-        forces = -grad
-        virials = torch.zeros((1, 3, 3))
-        stress = torch.zeros((1, 3, 3))
-        hessian = None
-        atom_virials = None
+            total_energy, (node_energy, inter_e, vectors, node_feats_out) = (
+                get_total_energy(data["positions"])
+            )
 
-        if big is not None:
-            cell = data["cell"].view(-1, 3, 3)
-            volume = torch.linalg.det(cell).abs().unsqueeze(-1)
-            stress = torch.einsum("ia,ib->ab", data["positions"], grad) / volume
-            stress = torch.where(
-                torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
+            forces, virials, stress, hessian, atom_virials = (
+                get_outputs(  # (-g, None, None, None, None)
+                    energy=inter_e,
+                    positions=data["positions"],
+                    displacement=displacement,
+                    cell=data["cell"],
+                    training=training,
+                    compute_force=compute_force,
+                    compute_virials=compute_virials,
+                    compute_stress=compute_stress,
+                    compute_hessian=compute_hessian,
+                )
             )
-            replica_idx = big.replica_idx.to(data["positions"].device)
-            forces = scatter_sum(
-                forces,
-                replica_idx,
-                dim_size=masses.shape[0],
-                dim=0,
+
+            output = {
+                "energy": total_energy,
+                "node_energy": node_energy,
+                "interaction_energy": inter_e,
+                "forces": forces,
+                "virials": virials,
+                "atom_virials": atom_virials,
+                "stress": stress,
+                "hessian": hessian,
+                "displacement": displacement,
+                "node_feats": node_feats_out,
+            }
+
+            return output
+        else:
+            grad_func = torch.func.grad_and_value(
+                get_total_energy,
+                has_aux=True,
             )
-        elif compute_virials or compute_stress:
-            grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(total_energy)]
-            virials = torch.autograd.grad(
-                outputs=[total_energy],  # [n_graphs, ]
-                inputs=[displacement],  # [n_nodes, 3]
-                grad_outputs=grad_outputs,
-                retain_graph=training,  # Make sure the graph is not destroyed during training
-                create_graph=training,  # Create graph for second derivative
-                allow_unused=True,
-            )[0]
-            stress = torch.zeros_like(displacement)
-            if compute_stress and virials is not None:
+
+            grad, (total_energy, aux) = grad_func(data["positions"])
+            total_energy = total_energy.unsqueeze(0)
+            (node_energy, inter_e, vectors, node_feats_out) = aux
+            forces = -grad
+            virials = torch.zeros((1, 3, 3))
+            stress = torch.zeros((1, 3, 3))
+            hessian = None
+            atom_virials = None
+
+            if big is not None:
                 cell = data["cell"].view(-1, 3, 3)
                 volume = torch.linalg.det(cell).abs().unsqueeze(-1)
-                stress = virials / volume.view(-1, 1, 1)
+                stress = torch.einsum("ia,ib->ab", data["positions"], grad) / volume
+                stress = torch.where(
+                    torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
+                )
+                replica_idx = big.replica_idx.to(data["positions"].device)
+                forces = scatter_sum(
+                    forces,
+                    replica_idx,
+                    dim_size=masses.shape[0],
+                    dim=0,
+                )
+            elif compute_virials or compute_stress:
+                # grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(total_energy)]
+                # virials = torch.autograd.grad(
+                #     outputs=[total_energy],  # [n_graphs, ]
+                #     inputs=[displacement],  # [n_nodes, 3]
+                #     grad_outputs=grad_outputs,
+                #     retain_graph=training,  # Make sure the graph is not destroyed during training
+                #     create_graph=training,  # Create graph for second derivative
+                #     allow_unused=True,
+                # )[0]
+                # stress = torch.zeros_like(displacement)
+                # if compute_stress and virials is not None:
+                #     cell = data["cell"].view(-1, 3, 3)
+                #     volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+                #     stress = virials / volume.view(-1, 1, 1)
+                #     stress = torch.where(
+                #         torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
+                #     )
+                cell = data["cell"].view(-1, 3, 3)
+                volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+                stress = torch.einsum("ia,ib->ab", data["positions"], grad) / volume
                 stress = torch.where(
                     torch.abs(stress) < 1e10, stress, torch.zeros_like(stress)
                 )
 
-        heat_flux = None
-        if compute_heat_flux:
+            heat_flux = None
+            if compute_heat_flux:
 
-            assert velocities is not None, "Velocities must be provided for heat flux"
-            assert masses is not None, "Masses must be provided for heat flux"
+                assert (
+                    velocities is not None
+                ), "Velocities must be provided for heat flux"
+                assert masses is not None, "Masses must be provided for heat flux"
 
-            r_aux = data["positions"].detach()
+                r_aux = data["positions"].detach()
 
-            velocities = (
-                torch.tensor(velocities)
-                .to(data["positions"].device)
-                .to(data["positions"].dtype)
-            )
-            unfolded_velocities = velocities[big.replica_idx]
+                velocities = (
+                    torch.tensor(velocities)
+                    .to(data["positions"].device)
+                    .to(data["positions"].dtype)
+                )
+                unfolded_velocities = velocities[big.replica_idx]
 
-            _, term_1 = torch.func.jvp(
-                lambda R: barycenter_fn(
-                    R,
-                    r_aux,
-                ),
-                (data["positions"],),
-                (unfolded_velocities,),
-            )
+                _, term_1 = torch.func.jvp(
+                    lambda R: barycenter_fn(
+                        R,
+                        r_aux,
+                    ),
+                    (data["positions"],),
+                    (unfolded_velocities,),
+                )
 
-            term_2 = torch.sum(
-                torch.sum(grad * unfolded_velocities, axis=1)[:, None] * r_aux,
-                axis=0,
-            )
-            hf_potential = term_1 - term_2
+                term_2 = torch.sum(
+                    torch.sum(grad * unfolded_velocities, axis=1)[:, None] * r_aux,
+                    axis=0,
+                )
+                hf_potential = term_1 - term_2
 
-            masses = (
-                torch.tensor(masses)
-                .to(data["positions"].device)
-                .to(data["positions"].dtype)
-            )
-            energies_kinetic = 0.5 * torch.einsum(
-                "i,ia,ia->i", masses, velocities, velocities
-            )
-            hf_convective_kinetic = torch.einsum(
-                "i,ia->a", energies_kinetic, velocities
-            )
-            hf_convective_potential = torch.einsum(
-                "i,ia->a", node_energy, unfolded_velocities
-            )
-            hf_convective = hf_convective_potential + hf_convective_kinetic
+                masses = (
+                    torch.tensor(masses)
+                    .to(data["positions"].device)
+                    .to(data["positions"].dtype)
+                )
+                energies_kinetic = 0.5 * torch.einsum(
+                    "i,ia,ia->i", masses, velocities, velocities
+                )
+                hf_convective_kinetic = torch.einsum(
+                    "i,ia->a", energies_kinetic, velocities
+                )
+                hf_convective_potential = torch.einsum(
+                    "i,ia->a", node_energy, unfolded_velocities
+                )
+                hf_convective = hf_convective_potential + hf_convective_kinetic
 
-            cell = data["cell"].view(-1, 3, 3)
-            volume = torch.linalg.det(cell).abs().unsqueeze(-1)
+                cell = data["cell"].view(-1, 3, 3)
+                volume = torch.linalg.det(cell).abs().unsqueeze(-1)
 
-            heat_flux = (hf_potential + hf_convective) / volume
+                heat_flux = (hf_potential + hf_convective) / volume
 
-        if big is not None:
-            node_energy = scatter_sum(
-                node_energy,
-                replica_idx,
-                dim_size=masses.shape[0],
-                dim=0,
-            )
+            if big is not None:
+                node_energy = scatter_sum(
+                    node_energy,
+                    replica_idx,
+                    dim_size=masses.shape[0],
+                    dim=0,
+                )
 
-        # total_energy, (node_energy, inter_e, vectors, node_feats_out) = (
-        #     get_total_energy(data["positions"])
-        # )
+            output = {
+                "energy": total_energy,
+                "node_energy": node_energy,
+                "interaction_energy": inter_e,
+                "forces": forces,
+                "virials": virials,
+                "atom_virials": atom_virials,
+                "heat_flux": heat_flux,
+                "stress": stress,
+                "hessian": hessian,
+                "displacement": displacement,
+                "node_feats": node_feats_out,
+            }
 
-        # forces, virials, stress, hessian, atom_virials = (
-        #     get_outputs(  # (-g, None, None, None, None)
-        #         energy=inter_e,
-        #         node_energy=node_energy,
-        #         positions=data["positions"],
-        #         displacement=displacement,
-        #         edge_vectors=vectors,
-        #         edge_index=data["edge_index"],
-        #         cell=data["cell"],
-        #         training=training,
-        #         compute_force=compute_force,
-        #         compute_virials=compute_virials,
-        #         compute_stress=compute_stress,
-        #         compute_hessian=compute_hessian,
-        #         compute_heat_flux=compute_heat_flux,
-        #         velocities=velocities,
-        #         big=big,
-        #         masses=masses,
-        #     )
-        # )
-
-        output = {
-            "energy": total_energy,
-            "node_energy": node_energy,
-            "interaction_energy": inter_e,
-            "forces": forces,
-            "virials": virials,
-            "atom_virials": atom_virials,
-            "heat_flux": heat_flux,
-            "stress": stress,
-            "hessian": hessian,
-            "displacement": displacement,
-            "node_feats": node_feats_out,
-        }
-
-        return output
+            return output
 
 
 class BOTNet(torch.nn.Module):

@@ -362,12 +362,12 @@ def compute_hessians_loop(
 
 def get_outputs(
     energy: torch.Tensor,
-    node_energy: Optional[torch.Tensor],
     positions: torch.Tensor,
     displacement: Optional[torch.Tensor],
     cell: torch.Tensor,
-    edge_vectors: Optional[torch.Tensor],
-    edge_index: Optional[torch.Tensor],
+    node_energy: Optional[torch.Tensor] = None,
+    edge_vectors: Optional[torch.Tensor] = None,
+    edge_index: Optional[torch.Tensor] = None,
     training: bool = False,
     compute_force: bool = True,
     compute_virials: bool = True,
@@ -385,39 +385,39 @@ def get_outputs(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
-    if compute_heat_flux:
-        forces, heat_flux = compute_forces_heat_flux(
-            energy=energy,
-            node_energy=node_energy,
-            positions=positions,
-            displacement=displacement,
-            edge_vectors=edge_vectors,
-            edge_index=edge_index,
-            cell=cell,
-            velocities=velocities,
-            training=(training or compute_hessian),
-            compute_stress=compute_stress,
-            big=big,
-            masses=masses,
-        )
-        stress = None
-        virials = None
-        atom_virials = None
+    # if compute_heat_flux:
+    #     forces, heat_flux = compute_forces_heat_flux(
+    #         energy=energy,
+    #         node_energy=node_energy,
+    #         positions=positions,
+    #         displacement=displacement,
+    #         edge_vectors=edge_vectors,
+    #         edge_index=edge_index,
+    #         cell=cell,
+    #         velocities=velocities,
+    #         training=(training or compute_hessian),
+    #         compute_stress=compute_stress,
+    #         big=big,
+    #         masses=masses,
+    #     )
+    #     stress = None
+    #     virials = None
+    #     atom_virials = None
 
-    elif compute_atom_virials and edge_vectors is not None and edge_index is not None:
-        forces, virials, stress, atom_virials = compute_forces_atom_virials(
-            energy=energy,
-            node_energy=node_energy,
-            positions=positions,
-            displacement=displacement,
-            edge_vectors=edge_vectors,
-            edge_index=edge_index,
-            cell=cell,
-            compute_stress=compute_stress,
-            training=(training or compute_hessian),
-        )
+    # elif compute_atom_virials and edge_vectors is not None and edge_index is not None:
+    #     forces, virials, stress, atom_virials = compute_forces_atom_virials(
+    #         energy=energy,
+    #         node_energy=node_energy,
+    #         positions=positions,
+    #         displacement=displacement,
+    #         edge_vectors=edge_vectors,
+    #         edge_index=edge_index,
+    #         cell=cell,
+    #         compute_stress=compute_stress,
+    #         training=(training or compute_hessian),
+    #     )
 
-    elif (compute_virials or compute_stress) and displacement is not None:
+    if (compute_virials or compute_stress) and displacement is not None:
         # forces come for free
         forces, virials, stress = compute_forces_virials(
             energy=energy,

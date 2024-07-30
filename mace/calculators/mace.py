@@ -66,6 +66,7 @@ class MACECalculator(Calculator):
         fullgraph=True,
         unfolding=False,
         compute_heat_flux=False,
+        old_method=False,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -174,12 +175,16 @@ class MACECalculator(Calculator):
 
         self.unfolding = unfolding
         self.compute_heat_flux = compute_heat_flux
+        self.old_method = old_method
 
     def set_unfolding(self, unfolding):
         self.unfolding = unfolding
 
     def set_compute_heat_flux(self, compute_heat_flux):
         self.compute_heat_flux = compute_heat_flux
+
+    def set_old_method(self, old_method):
+        self.old_method = old_method
 
     def _create_result_tensors(
         self, model_type: str, num_models: int, num_atoms: int
@@ -292,6 +297,7 @@ class MACECalculator(Calculator):
                 big=big,
                 masses=masses,
                 training=self.use_compile,
+                old_method=self.old_method,
             )
             if self.model_type in ["MACE", "EnergyDipoleMACE"]:
                 ret_tensors["energies"][i] = out["energy"].detach()
@@ -346,7 +352,7 @@ class MACECalculator(Calculator):
                         * self.energy_units_to_eV
                         / self.length_units_to_A**3
                     )
-            if out["heat_flux"] is not None:
+            if "heat_flux" in out and out["heat_flux"] is not None:
                 self.results["heat_flux"] = out["heat_flux"].detach().cpu().numpy()
         if self.model_type in ["DipoleMACE", "EnergyDipoleMACE"]:
             self.results["dipole"] = (
