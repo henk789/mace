@@ -189,7 +189,6 @@ def compute_forces_heat_flux(
     positions.retain_grad()
     barycenter.backward(torch.ones_like(barycenter))
     barycenter_grad = positions.grad.detach()
-    print(barycenter_grad.shape)
 
     term_1 = barycenter_grad @ unfolded_velocities
 
